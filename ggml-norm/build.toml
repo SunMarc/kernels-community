@@ -8,7 +8,7 @@
 [general]
 name = "ggml-norm"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["metal"]
 
@@ -22,7 +22,7 @@ src = [
 ]
 
 [kernel.ggml_norm_metal]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 # norm.metal includes "ggml-common.h" from vendor/src, so the shader compile needs it on its include
 # path; `torch-ext` is here because the backend source includes torch_binding.h.

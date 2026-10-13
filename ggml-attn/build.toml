@@ -8,7 +8,7 @@
 [general]
 name = "ggml-attn"
 version = 1
-edition = 5
+edition = 6
 license = "MIT"
 # Metal only. The cuda scaffolding that used to sit here was never compiled -- `git log -- ggml_attn_cuda`
 # has it, and `vendor/` still carries ggml's cuda sources.
@@ -25,7 +25,7 @@ src = [
 ]
 
 [kernel.ggml_attn_metal]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 # ggml-metal.metal includes "ggml-common.h" from vendor/src, so the shader compile needs it on its
 # include path; `torch-ext` is here because the backend source includes torch_binding.h.

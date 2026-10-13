@@ -6,7 +6,7 @@
 [general]
 name = "mlx-quantization-metal-kernels"
 version = 2
-edition = 5
+edition = 6
 license = "MIT"
 backends = ["metal"]
 
@@ -20,7 +20,7 @@ src = [
 ]
 
 [kernel.mlx_quantization_metal_kernels]
-backend = "metal"
+language = "cpp-metal"
 depends = ["torch"]
 # upstream includes "mlx/backend/metal/kernels/...", which resolves from vendor/
 include = ["mlx_metal", "torch-ext", "vendor"]
