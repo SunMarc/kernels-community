@@ -18,6 +18,7 @@ from dispatch import (
     dispatch,
     format_dry_run_payloads,
     parse_kernel_arg,
+    plan_dispatch,
 )
 
 KERNEL_RE = re.compile(r"^[A-Za-z0-9_-]+$")
@@ -138,12 +139,32 @@ def hub_kernel_branches(repo_id: str) -> set[str]:
     }
 
 
+def check_hub_upload_access(repo_id: str, branch: str, token: str) -> None:
+    encoded_repo_id = urllib.parse.quote(repo_id, safe="/")
+    encoded_branch = urllib.parse.quote(branch, safe="")
+    # Preupload checks authorization and classifies files; it does not upload
+    # anything or create a commit/PR. An empty list needs no build artifacts.
+    request = urllib.request.Request(
+        f"{HUB_API_ROOT}/kernels/{encoded_repo_id}/preupload/{encoded_branch}?create_pr=1",
+        data=json.dumps({"files": []}).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "kernels-community-kernel-bot",
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=HUB_API_TIMEOUT_SECONDS):
+        pass
+
+
 def preflight_external_uploads(
     kernels: list[str],
     *,
     requested_branch: str | None = None,
     ref: str = "",
     branch_lookup=None,
+    hf_token: str | None = None,
 ) -> list[str]:
     branch_lookup = branch_lookup or hub_kernel_branches
     failures = []
@@ -174,6 +195,38 @@ def preflight_external_uploads(
                 f"`{kernel}`: branch `{target.branch}` does not exist in external Hub "
                 f"repository `{target.repo_id}`. Ask a repository maintainer to create it first."
             )
+            continue
+
+        # None allows local dry-runs without credentials. Live commands pass
+        # an empty string when the workflow secret is missing and must fail.
+        if hf_token is None:
+            continue
+        if not hf_token:
+            failures.append(
+                f"`{kernel}`: HF_TOKEN is missing; cannot verify upload access to "
+                f"external Hub repository `{target.repo_id}`."
+            )
+            continue
+
+        # kernel-builder updates the card on main as well as the version
+        # branch. Check both, including when an explicit branch is requested.
+        for branch in dict.fromkeys(("main", target.branch)):
+            try:
+                check_hub_upload_access(target.repo_id, branch, hf_token)
+            except urllib.error.HTTPError as e:
+                failures.append(
+                    f"`{kernel}`: Hub upload authorization check failed for "
+                    f"`{target.repo_id}` on branch `{branch}` (HTTP {e.code}). "
+                    "Check the CI HF_TOKEN's permissions and the repository's "
+                    "pull request settings before retrying."
+                )
+                break
+            except OSError:
+                failures.append(
+                    f"`{kernel}`: could not verify upload access to "
+                    f"`{target.repo_id}` on branch `{branch}`; retry the command."
+                )
+                break
     return failures
 
 
@@ -376,10 +429,64 @@ def get_pull_request(api_base: str, token: str, issue_number: int):
     return json.loads(body)
 
 
-def merge_pull_request(api_base: str, token: str, issue_number: int):
+def latest_commit_statuses(api_base: str, token: str, head_sha: str) -> dict[str, dict]:
+    # The combined endpoint returns the latest status for each context, so a
+    # failed or pending rerun supersedes any earlier successful build.
+    statuses = {}
+    page = 1
+    ref = urllib.parse.quote(head_sha, safe="")
+    while True:
+        _, body = github_api_request(
+            f"{api_base}/commits/{ref}/status?per_page=100&page={page}", token
+        )
+        batch = json.loads(body)["statuses"]
+        for status in batch:
+            statuses.setdefault(status["context"], status)
+        if len(batch) < 100:
+            return statuses
+        page += 1
+
+
+def preflight_kernel_builds(
+    api_base: str, token: str, head_sha: str, kernels: list[str]
+) -> list[str]:
+    if not head_sha:
+        return ["Could not determine the PR head commit; no merge was attempted."]
+
+    try:
+        statuses = latest_commit_statuses(api_base, token, head_sha)
+    except (OSError, ValueError, KeyError, TypeError):
+        return [
+            "Could not read the current commit's build statuses; retry the command."
+        ]
+
+    failures = []
+    for kernel in kernels:
+        # Reuse dispatch's backend routing and Windows allowlist. Always
+        # require every configured workflow: a backend-filtered release
+        # command must not waive a platform's build requirement for merging.
+        plan = plan_dispatch(
+            kernel,
+            mode="pr",
+            metadata_ref=head_sha,
+            head_sha=head_sha,
+            upload=False,
+        )
+        if not plan.actions:
+            failures.append(f"`{kernel}`: no build workflow could be determined.")
+            continue
+        for action in plan.actions:
+            status = statuses.get(action.status_context, {})
+            state = status.get("state", "missing")
+            if state != "success":
+                failures.append(f"`{action.status_context}`: {state}.")
+    return failures
+
+
+def merge_pull_request(api_base: str, token: str, issue_number: int, head_sha: str):
     url = f"{api_base}/pulls/{issue_number}/merge"
     _, body = github_api_request(
-        url, token, method="PUT", data={"merge_method": "squash"}
+        url, token, method="PUT", data={"merge_method": "squash", "sha": head_sha}
     )
     return json.loads(body)
 
@@ -1025,7 +1132,8 @@ def main(*, dry_run: bool = False):
 
     # External Hub repositories are updated through pull requests. The Hub can
     # only open a pull request against an existing branch, and our token cannot
-    # create a new version branch in a vendor-owned repository. Check this
+    # create a new version branch in a vendor-owned repository. Check this and
+    # verify the upload token can access the PR preupload endpoint
     # before merge-and-upload merges the GitHub PR, and before either production
     # upload command spends time building artifacts that cannot be uploaded.
     if command in ("release", "merge-and-upload"):
@@ -1038,6 +1146,7 @@ def main(*, dry_run: bool = False):
             kernels,
             requested_branch=requested_branch,
             ref=config_ref or "",
+            hf_token=os.environ.get("HF_TOKEN", None if dry_run else ""),
         )
         if preflight_failures:
             failure_message = (
@@ -1081,7 +1190,9 @@ def main(*, dry_run: bool = False):
     merge_result_message = None
     if command == "merge-and-upload":
         if dry_run:
-            print("[dry-run] Would merge PR before dispatching.\n")
+            print(
+                "[dry-run] Would require successful builds for the PR head before merging.\n"
+            )
         elif pull_request.get("merged"):
             merge_result_message = "PR is already merged. Continuing with build/upload."
         elif pull_request.get("state") != "open":
@@ -1100,8 +1211,35 @@ def main(*, dry_run: bool = False):
             )
             return 0
         else:
+            build_failures = preflight_kernel_builds(
+                api_base, token, pr_head_sha, kernels
+            )
+            if build_failures:
+                try_send_issue_comment(
+                    api_base,
+                    token,
+                    issue_number,
+                    format_result_comment(
+                        command_summary,
+                        mode_text,
+                        target_branch,
+                        pr_head_sha,
+                        failure_message=(
+                            "Kernel build preflight failed; no merge or release was started:\n"
+                            + "\n".join(f"- {failure}" for failure in build_failures)
+                            + f"\n\nRun `/kernel-bot build {' '.join(kernels)}` or "
+                            f"`/kernel-bot build-and-stage {' '.join(kernels)}` on the "
+                            "current PR commit, wait for all required builds to succeed, "
+                            "then retry this command."
+                        ),
+                    ),
+                    comment_id=status_comment_id,
+                )
+                return 1
             try:
-                merge_response = merge_pull_request(api_base, token, issue_number)
+                merge_response = merge_pull_request(
+                    api_base, token, issue_number, pr_head_sha
+                )
             except urllib.error.HTTPError as e:
                 err_text = e.read().decode("utf-8", errors="replace")
                 print(

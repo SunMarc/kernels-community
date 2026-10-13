@@ -28,6 +28,7 @@ on:
       # test_pr_autolabel.py verifies that pushes to an open PR retrigger label
       # reconciliation.
       - ".github/workflows/pr-autolabel.yml"
+      - ".github/workflows/pr-comment-build.yaml"
       - ".github/workflows/test-ci-scripts.yaml"
   push:
     branches: [main]
@@ -37,6 +38,7 @@ on:
       - "**/build.toml"
       - ".github/workflows/build*.yaml"
       - ".github/workflows/pr-autolabel.yml"
+      - ".github/workflows/pr-comment-build.yaml"
       - ".github/workflows/test-ci-scripts.yaml"
   workflow_dispatch:
 

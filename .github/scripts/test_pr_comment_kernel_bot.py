@@ -1,7 +1,10 @@
+import io
+import json
 import os
 from pathlib import Path
 import subprocess
 import sys
+import urllib.error
 
 import pytest
 
@@ -82,7 +85,9 @@ def test_community_upload_does_not_need_branch_preflight(tmp_path, monkeypatch):
         raise AssertionError(f"unexpected Hub lookup for {repo_id}")
 
     assert (
-        bot.preflight_external_uploads(["example"], branch_lookup=unexpected_lookup)
+        bot.preflight_external_uploads(
+            ["example"], branch_lookup=unexpected_lookup, hf_token=""
+        )
         == []
     )
 
@@ -112,13 +117,136 @@ def test_external_upload_preflight_rejects_missing_branch(tmp_path, monkeypatch)
     assert "`vendor/example`" in failures[0]
 
 
+def test_hub_upload_access_checks_preupload_without_creating_a_pr(monkeypatch):
+    requests = []
+
+    def urlopen(request, *, timeout):
+        requests.append(request)
+        assert timeout == bot.HUB_API_TIMEOUT_SECONDS
+        return io.BytesIO(b'{"files": []}')
+
+    monkeypatch.setattr(bot.urllib.request, "urlopen", urlopen)
+
+    bot.check_hub_upload_access("vendor/example", "release/v3", "test-token")
+
+    assert len(requests) == 1
+    request = requests[0]
+    assert request.full_url == (
+        "https://huggingface.co/api/kernels/vendor/example/"
+        "preupload/release%2Fv3?create_pr=1"
+    )
+    assert request.method == "POST"
+    assert request.get_header("Authorization") == "Bearer test-token"
+    assert request.get_header("Content-type") == "application/json"
+    assert json.loads(request.data) == {"files": []}
+
+
+@pytest.mark.parametrize(
+    ("requested_branch", "expected_branches"),
+    [(None, ["main", "v3"]), ("main", ["main"]), ("stable", ["main", "stable"])],
+)
+def test_upload_preflight_checks_access_to_all_upload_branches(
+    tmp_path, monkeypatch, requested_branch, expected_branches
+):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+    checked = []
+    monkeypatch.setattr(
+        bot, "check_hub_upload_access", lambda *args: checked.append(args)
+    )
+
+    assert (
+        bot.preflight_external_uploads(
+            ["example"],
+            requested_branch=requested_branch,
+            branch_lookup=lambda _: {"main", "v3", "stable"},
+            hf_token="test-token",
+        )
+        == []
+    )
+    assert checked == [
+        ("vendor/example", branch, "test-token") for branch in expected_branches
+    ]
+
+
+@pytest.mark.parametrize("hf_token", [None, ""])
+def test_upload_preflight_without_token(tmp_path, monkeypatch, hf_token):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    def unexpected(*args):
+        raise AssertionError("must not send an unauthenticated upload check")
+
+    monkeypatch.setattr(bot, "check_hub_upload_access", unexpected)
+    failures = bot.preflight_external_uploads(
+        ["example"],
+        branch_lookup=lambda _: {"main", "v3"},
+        hf_token=hf_token,
+    )
+
+    if hf_token is None:  # Local dry-run.
+        assert failures == []
+    else:  # Missing CI secret.
+        assert len(failures) == 1
+        assert "HF_TOKEN is missing" in failures[0]
+
+
+@pytest.mark.parametrize("failed_branch", ["main", "v3"])
+@pytest.mark.parametrize("status", [401, 403])
+def test_upload_preflight_reports_denied_access(
+    tmp_path, monkeypatch, failed_branch, status
+):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    def check_access(repo_id, branch, token):
+        if branch == failed_branch:
+            raise urllib.error.HTTPError(
+                "https://huggingface.co", status, "Forbidden", {}, None
+            )
+
+    monkeypatch.setattr(bot, "check_hub_upload_access", check_access)
+    failures = bot.preflight_external_uploads(
+        ["example"],
+        branch_lookup=lambda _: {"main", "v3"},
+        hf_token="secret-test-token",
+    )
+
+    assert len(failures) == 1
+    assert "`vendor/example`" in failures[0]
+    assert f"branch `{failed_branch}`" in failures[0]
+    assert f"HTTP {status}" in failures[0]
+    assert "HF_TOKEN" in failures[0]
+    assert "secret-test-token" not in failures[0]
+
+
+def test_upload_preflight_reports_network_failure(tmp_path, monkeypatch):
+    write_build_toml(tmp_path, "example", repo_id="vendor/example", version=3)
+    monkeypatch.chdir(tmp_path)
+
+    def check_access(*args):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(bot, "check_hub_upload_access", check_access)
+    failures = bot.preflight_external_uploads(
+        ["example"],
+        branch_lookup=lambda _: {"main", "v3"},
+        hf_token="test-token",
+    )
+
+    assert len(failures) == 1
+    assert "could not verify upload access" in failures[0]
+
+
+@pytest.mark.parametrize("failure", ["missing_branch", "denied_upload"])
 @pytest.mark.parametrize(
     ("command", "expected_ref"),
     [("release", "main"), ("merge-and-upload", "abc123")],
 )
 def test_upload_preflight_failure_stops_before_merge_and_dispatch(
-    monkeypatch, command, expected_ref
+    monkeypatch, command, expected_ref, failure
 ):
+    monkeypatch.setenv("HF_TOKEN", "test-token")
     monkeypatch.setattr(
         bot,
         "_resolve_context_from_env",
@@ -146,12 +274,25 @@ def test_upload_preflight_failure_stops_before_merge_and_dispatch(
 
     checked = {}
 
-    def fail_preflight(kernels, **kwargs):
-        checked["kernels"] = kernels
-        checked.update(kwargs)
-        return ["missing external branch"]
+    def build_config(kernel, ref):
+        checked.update(kernel=kernel, ref=ref)
+        return {"general": {"version": 3, "hub": {"repo-id": "vendor/example"}}}
 
-    monkeypatch.setattr(bot, "preflight_external_uploads", fail_preflight)
+    monkeypatch.setattr(bot, "read_kernel_build_config", build_config)
+    monkeypatch.setattr(
+        bot,
+        "hub_kernel_branches",
+        lambda _: {"main"} if failure == "missing_branch" else {"main", "v3"},
+    )
+
+    def check_access(repo_id, branch, token):
+        assert failure == "denied_upload"
+        assert (repo_id, branch, token) == ("vendor/example", "main", "test-token")
+        raise urllib.error.HTTPError(
+            "https://huggingface.co", 403, "Forbidden", {}, None
+        )
+
+    monkeypatch.setattr(bot, "check_hub_upload_access", check_access)
 
     def unexpected(*args, **kwargs):
         raise AssertionError("merge or dispatch must not run after preflight failure")
@@ -167,12 +308,13 @@ def test_upload_preflight_failure_stops_before_merge_and_dispatch(
 
     assert bot.main() == 1
     assert checked == {
-        "kernels": ["example"],
-        "requested_branch": None,
+        "kernel": "example",
         "ref": expected_ref,
     }
     assert len(comments) == 1
     assert "no merge or build was started" in comments[0]
+    expected_failure = "HTTP 403" if failure == "denied_upload" else "does not exist"
+    assert expected_failure in comments[0]
 
 
 def test_build_with_kernels():

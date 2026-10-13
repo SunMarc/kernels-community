@@ -9,6 +9,8 @@ permissions:
   actions: write
   issues: write
   pull-requests: write
+  # Read build results and mark queued reruns pending before they start.
+  statuses: write
 
 jobs:
   handle-comment:
@@ -25,6 +27,8 @@ jobs:
       - name: Handle /kernel-bot command
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Check external Hub upload authorization before merging a PR.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
           # Read-only org token, used *solely* to look up team membership so
           # `/kernel-bot build` also works for the huggingface/transformers team.
           # GITHUB_TOKEN is repo-scoped and cannot read team rosters. If this
