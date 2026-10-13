@@ -30,7 +30,7 @@
   "liger-kernels": ["U08Q42K8MGW"],
   "mamba-ssm": ["U08Q42K8MGW"],
   "megablocks": [],
-  "metal-flash-sdpa": [],
+  "metal-flash-sdpa": ["U0586KAH2E9"],
   "mlx-quantization-metal-kernels": [],
   "mlx-rmsnorm": [],
   "mra": [],
